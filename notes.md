@@ -41,28 +41,94 @@ This document outlines identified technical debt items, performance optimization
 // To: app.get('/health', healthController)
 ```
 
-#### 2.3 Static Route Validation (Duplicate Logic)
-**Location:** `apiWhiteList.ts`  
-**Issue:** Redundant static route checks causing performance overhead
+#### 2.3 Static Route Optimization & Duplicate Logic Removal
+**Location:** `apiWhiteList.ts` and `server.ts`  
+**Issue:** Multiple performance bottlenecks in static file handling
 
-**Problem Analysis:**
-1. `apiWhiteListLogger()` method checks for static routes in `app.all('*')`
-2. Same check is duplicated in `app.all('*', isAllowed())`
-3. `shouldAllow()` check in `isAllowed()` method is redundant
+**Current Problems:**
+1. **Redundant Route Validation**: Static route checks are performed multiple times across different middleware layers
+2. **Inefficient Static File Serving**: Static files are processed through all middleware instead of being served directly
+3. **Performance Overhead**: Each static file request goes through authentication and validation checks unnecessarily
 
-**Solution:**
-- Remove duplicate `shouldAllow()` check from `isAllowed()` method
-- Consolidate static route validation logic
-- Add `/resource` and `/eclogin` directly to `checkIsStaticRoute() -> excludePath` list
+**Root Cause Analysis:**
+| Component | Current Behavior | Impact |
+|-----------|-----------------|---------|
+| `apiWhiteListLogger()` | Checks for static routes in `app.all('*')` | ⚠️ First redundant check |
+| `isAllowed()` method | Duplicates the same static route check | ⚠️ Second redundant check |
+| `shouldAllow()` function | Additional validation layer for same routes | ⚠️ Third redundant check |
+| Static file serving | Routes through middleware instead of `express.static` | 🔴 Major performance impact |
 
-**Code to Remove:**
+**Recommended Solution:**
+
+**Phase 1: Implement Express Static Middleware**
 ```javascript
-// Remove this entire condition from apiWhiteList.ts -> isAllowed()
+// Add this at the beginning of middleware configuration (server.ts)
+// This should be placed BEFORE session and other middleware to avoid unnecessary processing
+
+// Static assets with optimized caching
+app.use('/assets', express.static(path.join(__dirname, 'assets'), {
+  maxAge: '1d',        // 1 day cache for production assets
+  etag: true,          // Enable ETag headers for caching
+  lastModified: true,  // Enable Last-Modified headers
+  immutable: true      // Mark assets as immutable for better caching
+}));
+
+// Resource files
+app.use('/resource', express.static(path.join(__dirname, 'resource'), {
+  maxAge: '1h',        // Shorter cache for dynamic resources
+  etag: true,
+  lastModified: true
+}));
+```
+
+**Phase 2: Remove Redundant Validation Code**
+```javascript
+// REMOVE this entire block from apiWhiteList.ts -> isAllowed()
 if (shouldAllow(req) || _.includes(REQ_URL, '/resource') || _.includes(REQ_URL, '/eclogin')) {
     logDebug('Path : ' + REQ_URL + ' is in excluded list.')
     next()
 }
 ```
+
+**Phase 3: Update Middleware Order**
+```javascript
+// Optimized middleware configuration order in server.ts
+class Server {
+  private configureMiddleware() {
+    // 1. Static files FIRST (bypasses all other middleware)
+    this.setupStaticRoutes();
+    
+    // 2. Then configure other middleware
+    const sessionConfig = getSessionConfig();
+    this.app.use(expressSession(sessionConfig));
+    this.app.use(express.urlencoded({ extended: false, limit: '50mb' }));
+    this.app.use(express.json({ limit: '50mb' }));
+    this.setCookie();
+    
+    // 3. API middleware last
+    this.app.all('*', apiWhiteListLogger());
+  }
+  
+  private setupStaticRoutes() {
+    // Static routes configuration here
+  }
+}
+```
+
+**Implementation Benefits:**
+- ⚡ **Performance**: Static files served directly, skipping middleware stack
+- 🔄 **Caching**: Proper HTTP caching headers for better browser performance  
+- 🧹 **Code Cleanup**: Removes ~30 lines of redundant validation code
+- 📊 **Monitoring**: Cleaner request logs (static files won't appear in API logs)
+- 🛡️ **Security**: Static files bypass authentication middleware appropriately
+
+**Action Items:**
+1. Add `express.static` middleware configuration at the top of middleware stack
+2. Remove redundant validation logic from `apiWhiteList.ts`
+3. Update `excludePath` list in `checkIsStaticRoute()` method
+4. Test static file serving performance before and after changes
+5. Update middleware order documentation
+
 
 #### 2.4 File Upload Configuration
 **Location:** `server.ts -> configureMiddleware() -> this.app.use(fileUpload())`  
